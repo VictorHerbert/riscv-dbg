@@ -25,7 +25,9 @@ module dm_top #(
   // that don't use hart numbers in a contiguous fashion.
   parameter logic [NrHarts-1:0] SelectableHarts  = {NrHarts{1'b1}},
   // toggle new behavior to drive master_be_o during a read
-  parameter bit                 ReadByteEnable   = 1
+  parameter bit                 ReadByteEnable   = 1,
+  // Instatiates auth 
+  parameter bit                 EnableAuth       = 0
 ) (
   input  logic                  clk_i,       // clock
   // asynchronous reset active low, connect PoR here, not the system reset
@@ -73,7 +75,9 @@ module dm_top #(
 
   output logic                  dmi_resp_valid_o,
   input  logic                  dmi_resp_ready_i,
-  output dm::dmi_resp_t         dmi_resp_o
+  output dm::dmi_resp_t         dmi_resp_o,
+
+  input  logic [31:0]           auth_password
 );
 
   // Debug CSRs
@@ -117,7 +121,8 @@ module dm_top #(
   dm_csrs #(
     .NrHarts(NrHarts),
     .BusWidth(BusWidth),
-    .SelectableHarts(SelectableHarts)
+    .SelectableHarts(SelectableHarts),
+    .EnableAuth(EnableAuth)
   ) i_dm_csrs (
     .clk_i,
     .rst_ni,
@@ -164,7 +169,8 @@ module dm_top #(
     .sbdata_valid_i          ( sbdata_valid          ),
     .sbbusy_i                ( sbbusy                ),
     .sberror_valid_i         ( sberror_valid         ),
-    .sberror_i               ( sberror               )
+    .sberror_i               ( sberror               ),
+    .auth_password
   );
 
   dm_sba #(

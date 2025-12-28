@@ -18,7 +18,8 @@
 module dm_csrs #(
   parameter int unsigned        NrHarts          = 1,
   parameter int unsigned        BusWidth         = 32,
-  parameter logic [NrHarts-1:0] SelectableHarts  = {NrHarts{1'b1}}
+  parameter logic [NrHarts-1:0] SelectableHarts  = {NrHarts{1'b1}},
+  parameter logic               EnableAuth       = 0
 ) (
   input  logic                              clk_i,           // Clock
   input  logic                              rst_ni,          // Asynchronous reset active low
@@ -79,7 +80,9 @@ module dm_csrs #(
   // control signals
   input  logic                              sbbusy_i,
   input  logic                              sberror_valid_i, // bus error occurred
-  input  logic [2:0]                        sberror_i // bus error occurred
+  input  logic [2:0]                        sberror_i, // bus error occurred
+
+  input  logic [31:0]                       auth_password
 );
   // the amount of bits we need to represent all harts
   localparam int unsigned HartSelLen = (NrHarts == 1) ? 1 : $clog2(NrHarts);
@@ -104,6 +107,7 @@ module dm_csrs #(
   logic [((NrHarts-1)/2**10+1)*32-1:0] halted_flat1;
   logic [((NrHarts-1)/2**15+1)*32-1:0] halted_flat2;
   logic [31:0] halted_flat3;
+  logic [31:0] auth_data_q, auth_data_d;
 
   // haltsum0
   logic [14:0] hartsel_idx0;
@@ -232,7 +236,7 @@ module dm_csrs #(
     dmstatus    = '0;
     dmstatus.version = dm::DbgVersion013;
     // no authentication implemented
-    dmstatus.authenticated = 1'b1;
+    dmstatus.authenticated = EnableAuth ? (auth_password == auth_data_q) : 1'b1;
     // we do not support halt-on-reset sequence
     dmstatus.hasresethaltreq = 1'b0;
     // TODO(zarubaf) things need to change here if we implement the array mask
@@ -362,6 +366,7 @@ module dm_csrs #(
             resp_queue_inp.data = sbdata_q[63:32];
           end
         end
+        dm::AuthData: resp_queue_inp.data = '0; // Don't reveal the password
         default:;
       endcase
     end
@@ -506,6 +511,9 @@ module dm_csrs #(
           end else begin
             sbdata_d[63:32] = dmi_req_i.data;
           end
+        end
+        dm::AuthData: begin
+          auth_data_d = dmi_req_i.data;
         end
         default:;
       endcase
@@ -662,6 +670,7 @@ module dm_csrs #(
         sbcs_q                       <= sbcs_d;
         sbaddr_q                     <= sbaddr_d;
         sbdata_q                     <= sbdata_d;
+        auth_data_q                  <= auth_data_d;
       end
     end
   end
