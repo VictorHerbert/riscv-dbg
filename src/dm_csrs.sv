@@ -87,6 +87,8 @@ module dm_csrs #(
   // the amount of bits we need to represent all harts
   localparam int unsigned HartSelLen = (NrHarts == 1) ? 1 : $clog2(NrHarts);
   localparam int unsigned NrHartsAligned = 2**HartSelLen;
+  // A mask that exposes non authenticated readable bits
+  parameter logic DMStatusAuthMask = 32'h000000CF;
 
   dm::dtm_op_e dtm_op;
   assign dtm_op = dm::dtm_op_e'(dmi_req_i.op);
@@ -107,6 +109,7 @@ module dm_csrs #(
   logic [((NrHarts-1)/2**10+1)*32-1:0] halted_flat1;
   logic [((NrHarts-1)/2**15+1)*32-1:0] halted_flat2;
   logic [31:0] halted_flat3;
+
   logic [31:0] auth_data_q, auth_data_d;
 
   // haltsum0
@@ -298,90 +301,14 @@ module dm_csrs #(
 
     // reads
     if (dmi_req_ready_o && dmi_req_valid_i && dtm_op == dm::DTM_READ) begin
-      unique case (dm_csr_addr) inside
-        [(dm::Data0):DataEnd]: begin
-          resp_queue_inp.data = data_q[$clog2(dm::DataCount)'(autoexecdata_idx)];
-          if (!cmdbusy_i) begin
-            // check whether we need to re-execute the command (just give a cmd_valid)
-            cmd_valid_d = abstractauto_q.autoexecdata[autoexecdata_idx];
-          // An abstract command was executing while one of the data registers was read
-          end else begin
-            resp_queue_inp.resp = dm::DTM_BUSY;
-            if (cmderr_q == dm::CmdErrNone) begin
-              cmderr_d = dm::CmdErrBusy;
-            end
-          end
-        end
-        dm::DMControl:    resp_queue_inp.data = dmcontrol_q;
-        dm::DMStatus:     resp_queue_inp.data = dmstatus;
-        dm::Hartinfo:     resp_queue_inp.data = hartinfo_aligned[selected_hart];
-        dm::AbstractCS:   resp_queue_inp.data = abstractcs;
-        dm::AbstractAuto: resp_queue_inp.data = abstractauto_q;
-        dm::Command:      resp_queue_inp.data = '0;
-        dm::NextDM:       resp_queue_inp.data = next_dm_addr_i;
-        [(dm::ProgBuf0):ProgBufEnd]: begin
-          resp_queue_inp.data = progbuf_q[dmi_req_i.addr[$clog2(dm::ProgBufSize)-1:0]];
-          if (!cmdbusy_i) begin
-            // check whether we need to re-execute the command (just give a cmd_valid)
-            // range of autoexecprogbuf is 31:16
-            cmd_valid_d = abstractauto_q.autoexecprogbuf[{1'b1, dmi_req_i.addr[3:0]}];
-
-          // An abstract command was executing while one of the progbuf registers was read
-          end else begin
-            resp_queue_inp.resp = dm::DTM_BUSY;
-            if (cmderr_q == dm::CmdErrNone) begin
-              cmderr_d = dm::CmdErrBusy;
-            end
-          end
-        end
-        dm::HaltSum0: resp_queue_inp.data = haltsum0;
-        dm::HaltSum1: resp_queue_inp.data = haltsum1;
-        dm::HaltSum2: resp_queue_inp.data = haltsum2;
-        dm::HaltSum3: resp_queue_inp.data = haltsum3;
-        dm::SBCS: begin
-          resp_queue_inp.data = sbcs_q;
-        end
-        dm::SBAddress0: begin
-          resp_queue_inp.data = sbaddr_q[31:0];
-        end
-        dm::SBAddress1: begin
-          resp_queue_inp.data = sbaddr_q[63:32];
-        end
-        dm::SBData0: begin
-          // access while the SBA was busy
-          if (sbbusy_i || sbcs_q.sbbusyerror) begin
-            sbcs_d.sbbusyerror = 1'b1;
-            resp_queue_inp.resp = dm::DTM_BUSY;
-          end else begin
-            sbdata_read_valid_o = (sbcs_q.sberror == '0);
-            resp_queue_inp.data = sbdata_q[31:0];
-          end
-        end
-        dm::SBData1: begin
-          // access while the SBA was busy
-          if (sbbusy_i || sbcs_q.sbbusyerror) begin
-            sbcs_d.sbbusyerror = 1'b1;
-            resp_queue_inp.resp = dm::DTM_BUSY;
-          end else begin
-            resp_queue_inp.data = sbdata_q[63:32];
-          end
-        end
-        dm::AuthData: resp_queue_inp.data = '0; // Don't reveal the password
-        default:;
-      endcase
-    end
-
-    // write
-    if (dmi_req_ready_o && dmi_req_valid_i && dtm_op == dm::DTM_WRITE) begin
-      unique case (dm_csr_addr) inside
-        [(dm::Data0):DataEnd]: begin
-          if (dm::DataCount > 0) begin
-            // attempts to write them while busy is set does not change their value
+      if (dmstatus.authenticated) begin
+        unique case (dm_csr_addr) inside
+          [(dm::Data0):DataEnd]: begin
+            resp_queue_inp.data = data_q[$clog2(dm::DataCount)'(autoexecdata_idx)];
             if (!cmdbusy_i) begin
-              data_d[dmi_req_i.addr[$clog2(dm::DataCount)-1:0]] = dmi_req_i.data;
               // check whether we need to re-execute the command (just give a cmd_valid)
               cmd_valid_d = abstractauto_q.autoexecdata[autoexecdata_idx];
-            //An abstract command was executing while one of the data registers was written
+            // An abstract command was executing while one of the data registers was read
             end else begin
               resp_queue_inp.resp = dm::DTM_BUSY;
               if (cmderr_q == dm::CmdErrNone) begin
@@ -389,134 +316,239 @@ module dm_csrs #(
               end
             end
           end
-        end
-        dm::DMControl: begin
-          dmcontrol_d = dmi_req_i.data;
-          // clear the havreset of the selected hart
-          if (dmcontrol_d.ackhavereset) begin
-            havereset_d_aligned[selected_hart] = 1'b0;
-          end
-        end
-        dm::DMStatus:; // write are ignored to R/O register
-        dm::Hartinfo:; // hartinfo is R/O
-        // only command error is write-able
-        dm::AbstractCS: begin // W1C
-          // Gets set if an abstract command fails. The bits in this
-          // field remain set until they are cleared by writing 1 to
-          // them. No abstract command is started until the value is
-          // reset to 0.
-          a_abstractcs = dm::abstractcs_t'(dmi_req_i.data);
-          // reads during abstract command execution are not allowed
-          if (!cmdbusy_i) begin
-            cmderr_d = dm::cmderr_e'(~a_abstractcs.cmderr & cmderr_q);
-          end else begin
-            resp_queue_inp.resp = dm::DTM_BUSY;
-            if (cmderr_q == dm::CmdErrNone) begin
-              cmderr_d = dm::CmdErrBusy;
+          dm::DMControl:    resp_queue_inp.data = dmcontrol_q;
+          dm::DMStatus:     resp_queue_inp.data = dmstatus;
+          dm::Hartinfo:     resp_queue_inp.data = hartinfo_aligned[selected_hart];
+          dm::AbstractCS:   resp_queue_inp.data = abstractcs;
+          dm::AbstractAuto: resp_queue_inp.data = abstractauto_q;
+          dm::Command:      resp_queue_inp.data = '0;
+          dm::NextDM:       resp_queue_inp.data = next_dm_addr_i;
+          [(dm::ProgBuf0):ProgBufEnd]: begin
+            resp_queue_inp.data = progbuf_q[dmi_req_i.addr[$clog2(dm::ProgBufSize)-1:0]];
+            if (!cmdbusy_i) begin
+              // check whether we need to re-execute the command (just give a cmd_valid)
+              // range of autoexecprogbuf is 31:16
+              cmd_valid_d = abstractauto_q.autoexecprogbuf[{1'b1, dmi_req_i.addr[3:0]}];
+
+            // An abstract command was executing while one of the progbuf registers was read
+            end else begin
+              resp_queue_inp.resp = dm::DTM_BUSY;
+              if (cmderr_q == dm::CmdErrNone) begin
+                cmderr_d = dm::CmdErrBusy;
+              end
             end
           end
-        end
-        dm::Command: begin
-          // writes are ignored if a command is already busy
-          if (!cmdbusy_i) begin
-            cmd_valid_d = 1'b1;
-            command_d = dm::command_t'(dmi_req_i.data);
-          // if there was an attempted to write during a busy execution
-          // and the cmderror field is zero set the busy error
-          end else begin
-            resp_queue_inp.resp = dm::DTM_BUSY;
-            if (cmderr_q == dm::CmdErrNone) begin
-              cmderr_d = dm::CmdErrBusy;
+          dm::HaltSum0: resp_queue_inp.data = haltsum0;
+          dm::HaltSum1: resp_queue_inp.data = haltsum1;
+          dm::HaltSum2: resp_queue_inp.data = haltsum2;
+          dm::HaltSum3: resp_queue_inp.data = haltsum3;
+          dm::SBCS: begin
+            resp_queue_inp.data = sbcs_q;
+          end
+          dm::SBAddress0: begin
+            resp_queue_inp.data = sbaddr_q[31:0];
+          end
+          dm::SBAddress1: begin
+            resp_queue_inp.data = sbaddr_q[63:32];
+          end
+          dm::SBData0: begin
+            // access while the SBA was busy
+            if (sbbusy_i || sbcs_q.sbbusyerror) begin
+              sbcs_d.sbbusyerror = 1'b1;
+              resp_queue_inp.resp = dm::DTM_BUSY;
+            end else begin
+              sbdata_read_valid_o = (sbcs_q.sberror == '0);
+              resp_queue_inp.data = sbdata_q[31:0];
             end
           end
-        end
-        dm::NextDM:; // nextdm is R/O
-        dm::AbstractAuto: begin
-          // this field can only be written legally when there is no command executing
-          if (!cmdbusy_i) begin
-            abstractauto_d                 = 32'h0;
-            abstractauto_d.autoexecdata    = 12'(dmi_req_i.data[dm::DataCount-1:0]);
-            abstractauto_d.autoexecprogbuf = 16'(dmi_req_i.data[dm::ProgBufSize-1+16:16]);
-          end else begin
-            resp_queue_inp.resp = dm::DTM_BUSY;
-            if (cmderr_q == dm::CmdErrNone) begin
-              cmderr_d = dm::CmdErrBusy;
+          dm::SBData1: begin
+            // access while the SBA was busy
+            if (sbbusy_i || sbcs_q.sbbusyerror) begin
+              sbcs_d.sbbusyerror = 1'b1;
+              resp_queue_inp.resp = dm::DTM_BUSY;
+            end else begin
+              resp_queue_inp.data = sbdata_q[63:32];
             end
           end
-        end
-        [(dm::ProgBuf0):ProgBufEnd]: begin
-          // attempts to write them while busy is set does not change their value
-          if (!cmdbusy_i) begin
-            progbuf_d[dmi_req_i.addr[$clog2(dm::ProgBufSize)-1:0]] = dmi_req_i.data;
-            // check whether we need to re-execute the command (just give a cmd_valid)
-            // this should probably throw an error if executed during another command
-            // was busy
-            // range of autoexecprogbuf is 31:16
-            cmd_valid_d = abstractauto_q.autoexecprogbuf[{1'b1, dmi_req_i.addr[3:0]}];
-          //An abstract command was executing while one of the progbuf registers was written
-          end else begin
-            resp_queue_inp.resp = dm::DTM_BUSY;
-            if (cmderr_q == dm::CmdErrNone) begin
-              cmderr_d = dm::CmdErrBusy;
+          dm::AuthData:; // Nothing to show
+          default:;
+        endcase
+      end
+      else begin
+        unique case (dm_csr_addr) inside
+          dm::DMControl: begin
+            resp_queue_inp.data[0] = dmcontrol_q.dmactive;
+          end
+          dm::DMStatus: begin
+            resp_queue_inp.data = DMStatusAuthMask & dmstatus;
+          end
+          dm::AuthData:; // Nothing to show
+          default:;
+        endcase
+      end
+      
+    end
+
+    // write
+    if (dmi_req_ready_o && dmi_req_valid_i && dtm_op == dm::DTM_WRITE) begin
+      if (dmstatus.authenticated) begin
+        unique case (dm_csr_addr) inside
+          [(dm::Data0):DataEnd]: begin
+            if (dm::DataCount > 0) begin
+              // attempts to write them while busy is set does not change their value
+              if (!cmdbusy_i) begin
+                data_d[dmi_req_i.addr[$clog2(dm::DataCount)-1:0]] = dmi_req_i.data;
+                // check whether we need to re-execute the command (just give a cmd_valid)
+                cmd_valid_d = abstractauto_q.autoexecdata[autoexecdata_idx];
+              //An abstract command was executing while one of the data registers was written
+              end else begin
+                resp_queue_inp.resp = dm::DTM_BUSY;
+                if (cmderr_q == dm::CmdErrNone) begin
+                  cmderr_d = dm::CmdErrBusy;
+                end
+              end
             end
           end
-        end
-        dm::SBCS: begin
-          // access while the SBA was busy
-          if (sbbusy_i) begin
-            sbcs_d.sbbusyerror = 1'b1;
-            resp_queue_inp.resp = dm::DTM_BUSY;
-          end else begin
-            sbcs = dm::sbcs_t'(dmi_req_i.data);
-            sbcs_d = sbcs;
-            // R/W1C
-            sbcs_d.sbbusyerror = sbcs_q.sbbusyerror & (~sbcs.sbbusyerror);
-            sbcs_d.sberror     = (|sbcs.sberror) ? 3'b0 : sbcs_q.sberror;
+          dm::DMControl: begin
+            dmcontrol_d = dmi_req_i.data;
+            // clear the havreset of the selected hart
+            if (dmcontrol_d.ackhavereset) begin
+              havereset_d_aligned[selected_hart] = 1'b0;
+            end
           end
-        end
-        dm::SBAddress0: begin
-          // access while the SBA was busy
-          if (sbbusy_i || sbcs_q.sbbusyerror) begin
-            sbcs_d.sbbusyerror = 1'b1;
-            resp_queue_inp.resp = dm::DTM_BUSY;
-          end else begin
-            sbaddr_d[31:0] = dmi_req_i.data;
-            sbaddress_write_valid_o = (sbcs_q.sberror == '0);
+          dm::DMStatus:; // write are ignored to R/O register
+          dm::Hartinfo:; // hartinfo is R/O
+          // only command error is write-able
+          dm::AbstractCS: begin // W1C
+            // Gets set if an abstract command fails. The bits in this
+            // field remain set until they are cleared by writing 1 to
+            // them. No abstract command is started until the value is
+            // reset to 0.
+            a_abstractcs = dm::abstractcs_t'(dmi_req_i.data);
+            // reads during abstract command execution are not allowed
+            if (!cmdbusy_i) begin
+              cmderr_d = dm::cmderr_e'(~a_abstractcs.cmderr & cmderr_q);
+            end else begin
+              resp_queue_inp.resp = dm::DTM_BUSY;
+              if (cmderr_q == dm::CmdErrNone) begin
+                cmderr_d = dm::CmdErrBusy;
+              end
+            end
           end
-        end
-        dm::SBAddress1: begin
-          // access while the SBA was busy
-          if (sbbusy_i || sbcs_q.sbbusyerror) begin
-            sbcs_d.sbbusyerror = 1'b1;
-            resp_queue_inp.resp = dm::DTM_BUSY;
-          end else begin
-            sbaddr_d[63:32] = dmi_req_i.data;
+          dm::Command: begin
+            // writes are ignored if a command is already busy
+            if (!cmdbusy_i) begin
+              cmd_valid_d = 1'b1;
+              command_d = dm::command_t'(dmi_req_i.data);
+            // if there was an attempted to write during a busy execution
+            // and the cmderror field is zero set the busy error
+            end else begin
+              resp_queue_inp.resp = dm::DTM_BUSY;
+              if (cmderr_q == dm::CmdErrNone) begin
+                cmderr_d = dm::CmdErrBusy;
+              end
+            end
           end
-        end
-        dm::SBData0: begin
-          // access while the SBA was busy
-          if (sbbusy_i || sbcs_q.sbbusyerror) begin
-           sbcs_d.sbbusyerror = 1'b1;
-           resp_queue_inp.resp = dm::DTM_BUSY;
-          end else begin
-            sbdata_d[31:0] = dmi_req_i.data;
-            sbdata_write_valid_o = (sbcs_q.sberror == '0);
+          dm::NextDM:; // nextdm is R/O
+          dm::AbstractAuto: begin
+            // this field can only be written legally when there is no command executing
+            if (!cmdbusy_i) begin
+              abstractauto_d                 = 32'h0;
+              abstractauto_d.autoexecdata    = 12'(dmi_req_i.data[dm::DataCount-1:0]);
+              abstractauto_d.autoexecprogbuf = 16'(dmi_req_i.data[dm::ProgBufSize-1+16:16]);
+            end else begin
+              resp_queue_inp.resp = dm::DTM_BUSY;
+              if (cmderr_q == dm::CmdErrNone) begin
+                cmderr_d = dm::CmdErrBusy;
+              end
+            end
           end
-        end
-        dm::SBData1: begin
-          // access while the SBA was busy
-          if (sbbusy_i || sbcs_q.sbbusyerror) begin
-           sbcs_d.sbbusyerror = 1'b1;
-           resp_queue_inp.resp = dm::DTM_BUSY;
-          end else begin
-            sbdata_d[63:32] = dmi_req_i.data;
+          [(dm::ProgBuf0):ProgBufEnd]: begin
+            // attempts to write them while busy is set does not change their value
+            if (!cmdbusy_i) begin
+              progbuf_d[dmi_req_i.addr[$clog2(dm::ProgBufSize)-1:0]] = dmi_req_i.data;
+              // check whether we need to re-execute the command (just give a cmd_valid)
+              // this should probably throw an error if executed during another command
+              // was busy
+              // range of autoexecprogbuf is 31:16
+              cmd_valid_d = abstractauto_q.autoexecprogbuf[{1'b1, dmi_req_i.addr[3:0]}];
+            //An abstract command was executing while one of the progbuf registers was written
+            end else begin
+              resp_queue_inp.resp = dm::DTM_BUSY;
+              if (cmderr_q == dm::CmdErrNone) begin
+                cmderr_d = dm::CmdErrBusy;
+              end
+            end
           end
-        end
-        dm::AuthData: begin
-          auth_data_d = dmi_req_i.data;
-        end
-        default:;
-      endcase
+          dm::SBCS: begin
+            // access while the SBA was busy
+            if (sbbusy_i) begin
+              sbcs_d.sbbusyerror = 1'b1;
+              resp_queue_inp.resp = dm::DTM_BUSY;
+            end else begin
+              sbcs = dm::sbcs_t'(dmi_req_i.data);
+              sbcs_d = sbcs;
+              // R/W1C
+              sbcs_d.sbbusyerror = sbcs_q.sbbusyerror & (~sbcs.sbbusyerror);
+              sbcs_d.sberror     = (|sbcs.sberror) ? 3'b0 : sbcs_q.sberror;
+            end
+          end
+          dm::SBAddress0: begin
+            // access while the SBA was busy
+            if (sbbusy_i || sbcs_q.sbbusyerror) begin
+              sbcs_d.sbbusyerror = 1'b1;
+              resp_queue_inp.resp = dm::DTM_BUSY;
+            end else begin
+              sbaddr_d[31:0] = dmi_req_i.data;
+              sbaddress_write_valid_o = (sbcs_q.sberror == '0);
+            end
+          end
+          dm::SBAddress1: begin
+            // access while the SBA was busy
+            if (sbbusy_i || sbcs_q.sbbusyerror) begin
+              sbcs_d.sbbusyerror = 1'b1;
+              resp_queue_inp.resp = dm::DTM_BUSY;
+            end else begin
+              sbaddr_d[63:32] = dmi_req_i.data;
+            end
+          end
+          dm::SBData0: begin
+            // access while the SBA was busy
+            if (sbbusy_i || sbcs_q.sbbusyerror) begin
+              sbcs_d.sbbusyerror = 1'b1;
+              resp_queue_inp.resp = dm::DTM_BUSY;
+            end else begin
+              sbdata_d[31:0] = dmi_req_i.data;
+              sbdata_write_valid_o = (sbcs_q.sberror == '0);
+            end
+          end
+          dm::SBData1: begin
+            // access while the SBA was busy
+            if (sbbusy_i || sbcs_q.sbbusyerror) begin
+              sbcs_d.sbbusyerror = 1'b1;
+              resp_queue_inp.resp = dm::DTM_BUSY;
+            end else begin
+              sbdata_d[63:32] = dmi_req_i.data;
+            end
+          end
+          dm::AuthData: begin
+            auth_data_d = dmi_req_i.data;
+          end
+          default:;
+        endcase
+      end
+      else begin
+        unique case (dm_csr_addr) inside
+          dm::DMControl: begin
+            dmcontrol_d.dmactive = dmi_req_i.data[0];
+          end
+          dm::AuthData: begin
+            auth_data_d = dmi_req_i.data;
+          end
+          default:;
+        endcase
+      end
+      
     end
     // hart threw a command error and has precedence over bus writes
     if (cmderror_valid_i) begin
