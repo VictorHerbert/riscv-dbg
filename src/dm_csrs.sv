@@ -88,7 +88,7 @@ module dm_csrs #(
   localparam int unsigned HartSelLen = (NrHarts == 1) ? 1 : $clog2(NrHarts);
   localparam int unsigned NrHartsAligned = 2**HartSelLen;
   // A mask that exposes non authenticated readable bits
-  parameter logic DMStatusAuthMask = 32'h000000CF;
+  parameter logic[31:0] DMStatusAuthMask = 32'h000000CF;
 
   dm::dtm_op_e dtm_op;
   assign dtm_op = dm::dtm_op_e'(dmi_req_i.op);
