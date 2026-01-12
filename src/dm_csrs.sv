@@ -664,6 +664,7 @@ module dm_csrs #(
       sbaddr_q       <= '0;
       sbdata_q       <= '0;
       havereset_q    <= '1;
+      auth_data_q    <= '0;
     end else begin
       havereset_q    <= SelectableHarts & havereset_d;
       // synchronous re-set of debug module, active-low, except for dmactive
