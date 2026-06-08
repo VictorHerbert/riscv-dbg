@@ -1,10 +1,10 @@
 /* Copyright 2018 ETH Zurich and University of Bologna.
  * Copyright and related rights are licensed under the Solderpad Hardware
- * License, Version 0.51 (the “License”); you may not use this file except in
+ * License, Version 0.51 (the ?License?); you may not use this file except in
  * compliance with the License.  You may obtain a copy of the License at
  * http://solderpad.org/licenses/SHL-0.51. Unless required by applicable law
  * or agreed to in writing, software, hardware and materials distributed under
- * this License is distributed on an “AS IS” BASIS, WITHOUT WARRANTIES OR
+ * this License is distributed on an ?AS IS? BASIS, WITHOUT WARRANTIES OR
  * CONDITIONS OF ANY KIND, either express or implied. See the License for the
  * specific language governing permissions and limitations under the License.
  *
@@ -88,7 +88,10 @@ module dm_csrs #(
   localparam int unsigned HartSelLen = (NrHarts == 1) ? 1 : $clog2(NrHarts);
   localparam int unsigned NrHartsAligned = 2**HartSelLen;
   // A mask that exposes non authenticated readable bits
-  parameter logic[31:0] DMStatusAuthMask = 32'h000000CF;
+  localparam logic[31:0] DMStatusAuthMask = 32'h000000CF;
+  
+  localparam int AuthBits = 64;
+  localparam passWords = AuthBits/32;
 
   dm::dtm_op_e dtm_op;
   assign dtm_op = dm::dtm_op_e'(dmi_req_i.op);
@@ -110,7 +113,8 @@ module dm_csrs #(
   logic [((NrHarts-1)/2**15+1)*32-1:0] halted_flat2;
   logic [31:0] halted_flat3;
 
-  logic [31:0] auth_data_q, auth_data_d;
+  logic [AuthBits-1:0] auth_data_q, auth_data_d;
+  logic [passWords-1:0] auth_counter_q, auth_counter_d;
 
   // haltsum0
   logic [14:0] hartsel_idx0;
@@ -238,8 +242,9 @@ module dm_csrs #(
     // dmstatus
     dmstatus    = '0;
     dmstatus.version = dm::DbgVersion013;
-    // no authentication implemented
+    // Authentication
     dmstatus.authenticated = EnableAuth ? (auth_password == auth_data_q) : 1'b1;
+    dmstatus.authbusy = !auth_counter_q[0];
     // we do not support halt-on-reset sequence
     dmstatus.hasresethaltreq = 1'b0;
     // TODO(zarubaf) things need to change here if we implement the array mask
@@ -298,6 +303,9 @@ module dm_csrs #(
     // helper variables
     sbcs         = '0;
     a_abstractcs = '0;
+
+    auth_data_d = auth_data_q;
+    auth_counter_d = auth_counter_q;
 
     // reads
     if (dmi_req_ready_o && dmi_req_valid_i && dtm_op == dm::DTM_READ) begin
@@ -532,7 +540,9 @@ module dm_csrs #(
             end
           end
           dm::AuthData: begin
-            auth_data_d = dmi_req_i.data;
+            if (auth_counter_q[0]) auth_data_d[31:0]     = dmi_req_i.data;
+            if (auth_counter_q[1]) auth_data_d[63:32]    = dmi_req_i.data;
+            auth_counter_d = {auth_counter_q<<1, auth_counter_q[1]};
           end
           default:;
         endcase
@@ -543,7 +553,9 @@ module dm_csrs #(
             dmcontrol_d.dmactive = dmi_req_i.data[0];
           end
           dm::AuthData: begin
-            auth_data_d = dmi_req_i.data;
+            if (auth_counter_q[0]) auth_data_d[31:0]     = dmi_req_i.data;
+            if (auth_counter_q[1]) auth_data_d[63:32]    = dmi_req_i.data;
+            auth_counter_d = {auth_counter_q<<1, auth_counter_q[1]};
           end
           default:;
         endcase
@@ -665,6 +677,7 @@ module dm_csrs #(
       sbdata_q       <= '0;
       havereset_q    <= '1;
       auth_data_q    <= '0;
+      auth_counter_q   <= 1; // 00..01
     end else begin
       havereset_q    <= SelectableHarts & havereset_d;
       // synchronous re-set of debug module, active-low, except for dmactive
@@ -704,6 +717,7 @@ module dm_csrs #(
         sbaddr_q                     <= sbaddr_d;
         sbdata_q                     <= sbdata_d;
         auth_data_q                  <= auth_data_d;
+        auth_counter_q               <= auth_counter_d;
       end
     end
   end
